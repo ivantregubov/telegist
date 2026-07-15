@@ -25,6 +25,9 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from telethon import TelegramClient
 
+if sys.platform == "win32":  # стабильный event loop для asyncio на Windows
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 BASE_DIR = Path(__file__).resolve().parent
 MSK = timezone(timedelta(hours=3))
 TG_MSG_LIMIT = 4096            # лимит Telegram на длину одного сообщения
@@ -275,6 +278,7 @@ async def main():
     except Exception as e:
         digest = f"Дайджест упал с ошибкой: {esc(repr(e))}"
         if not args.dry_run:
+            # ошибки всегда в Избранное, даже если дайджест идёт в канал
             for part in split_message(digest):
                 await client.send_message("me", part, parse_mode="html",
                                           link_preview=False)
@@ -284,8 +288,9 @@ async def main():
     if args.dry_run:
         print(re.sub(r"</?[a-z][^>]*>", "", digest))
     else:
+        target = cfg.get("target", "me")
         for part in split_message(digest):
-            await client.send_message("me", part, parse_mode="html",
+            await client.send_message(target, part, parse_mode="html",
                                       link_preview=False)
 
     await client.disconnect()
