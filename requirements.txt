@@ -1,0 +1,4 @@
+telethon>=1.36
+openai>=1.40
+PyYAML>=6.0
+python-dotenv>=1.0
