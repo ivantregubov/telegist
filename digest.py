@@ -70,15 +70,42 @@ PROMPT_TEMPLATE = """Ты персональный фильтр новостей
    Будь скуп: 8-10 это редкость (прямое влияние на деньги или планы), 6-7 значимо,
    4-5 фон, 0-3 шум.
 3. Для тем со score 6 и выше заполни why (почему это влияет лично на него,
-   1-2 предложения) и action (конкретный следующий шаг, если он есть, иначе null).
+   1-2 предложения).
 4. Ничего не выдумывай, опирайся только на факты из постов.
 5. Верни не больше 35 тем: одиночные малозначимые посты объединяй
    в сборные темы.
 
 Ответь строго валидным json без пояснений, схема:
 {"topics": [{"title": "суть темы одной строкой, до 90 знаков, без кликбейта",
-"score": 7, "why": "строка или null", "action": "строка или null",
-"post_ids": [3, 17]}]}"""
+"score": 7, "why": "строка или null", "post_ids": [3, 17]}]}"""
+
+CHAT_PROMPT_TEMPLATE = """Тебе даны обсуждения из телеграм-чатов: номер, статистика
+и выборочные сообщения каждой ветки. Для каждой ветки определи тему и суть.
+
+Правила:
+1. title: о чём спорили или говорили, до 60 знаков, без кликбейта.
+2. gist: одно предложение с сутью или выводом обсуждения, если вывод был.
+3. Ничего не выдумывай, только то, что видно в сообщениях.
+
+Ответь строго валидным json:
+{"threads": [{"id": 1, "title": "...", "gist": "..."}]}"""
+
+WEATHER_PROMPT_TEMPLATE = """Ты метеодежурный. По постам погодных каналов за последние
+сутки реши, нужно ли предупреждать жителя Москвы о завтрашней погоде.
+
+Предупреждение нужно ТОЛЬКО если из постов явно следует хотя бы одно:
+1. Завтра в Москве температура упадёт более чем на 10 градусов по сравнению
+   с сегодняшним днём.
+2. Завтра в Москве ожидается очень сильный дождь, ливень, град, шторм или
+   объявлен жёлтый, оранжевый либо красный уровень погодной опасности.
+
+Если явных указаний нет, речь не про Москву или не про завтра, предупреждение
+не нужно. Любое сомнение трактуй как "не нужно". Не выдумывай числа.
+
+Ответь строго валидным json:
+{"alert": true или false, "message": "если alert true: 2-3 предложения, что именно
+ожидается завтра с числами из постов и одна практическая рекомендация;
+если false: пустая строка"}"""
 
 
 def load_config():
@@ -107,14 +134,15 @@ def compile_ad_patterns(cfg):
     return [re.compile(p, re.IGNORECASE) for p in cfg.get("ad_patterns", [])]
 
 
-async def fetch_posts(client, cfg):
-    """Собирает посты за hours_lookback часов из всех каналов конфига."""
+async def fetch_posts(client, cfg, channels=None):
+    """Собирает посты за hours_lookback часов. По умолчанию из cfg["channels"],
+    но список можно переопределить (например, погодными каналами)."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=cfg["hours_lookback"])
     patterns = compile_ad_patterns(cfg)
     posts, warnings = [], []
     seen_hashes, seen_groups = set(), set()
 
-    for ch in cfg["channels"]:
+    for ch in (channels if channels is not None else cfg["channels"]):
         try:
             entity = await client.get_entity(ch)
         except Exception as e:
@@ -207,6 +235,167 @@ def rank_topics(posts, cfg):
     return topics
 
 
+def llm_client():
+    return OpenAI(api_key=os.environ["DEEPSEEK_API_KEY"],
+                  base_url="https://api.deepseek.com")
+
+
+def cluster_threads(msgs, min_size):
+    """Собирает ветки обсуждений по цепочкам ответов (union-find).
+    msgs: {id: {"id", "reply", "text", "re"}}. Возвращает списки сообщений."""
+    parent = {mid: mid for mid in msgs}
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    for m in msgs.values():
+        r = m["reply"]
+        if r and r in msgs:
+            ra, rb = find(m["id"]), find(r)
+            if ra != rb:
+                parent[ra] = rb
+
+    clusters = {}
+    for mid in msgs:
+        clusters.setdefault(find(mid), []).append(msgs[mid])
+    return [sorted(c, key=lambda m: m["id"])
+            for c in clusters.values() if len(c) >= min_size]
+
+
+async def fetch_chat_threads(client, cfg):
+    """Вытаскивает из чатов ветки обсуждений, ранжирует по длине и реакциям."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=cfg["hours_lookback"])
+    threads, warnings = [], []
+
+    for ch in cfg.get("chats") or []:
+        try:
+            entity = await client.get_entity(ch)
+        except Exception as e:
+            warnings.append(f"чат {ch}: {e}")
+            continue
+        chat_name = getattr(entity, "title", None) or str(ch)
+        username = getattr(entity, "username", None)
+
+        msgs = {}
+        async for m in client.iter_messages(entity, limit=2000):
+            if m.date < cutoff:
+                break
+            reacts = 0
+            if m.reactions and m.reactions.results:
+                reacts = sum(r.count for r in m.reactions.results)
+            msgs[m.id] = {"id": m.id, "reply": m.reply_to_msg_id,
+                          "text": (m.raw_text or "").strip()[:250], "re": reacts}
+
+        for items in cluster_threads(msgs, cfg.get("chat_min_thread", 4)):
+            texted = [m for m in items if m["text"]]
+            if not texted:
+                continue
+            top_reacted = sorted(texted, key=lambda m: -m["re"])[:4]
+            picked = ({m["id"] for m in texted[:3]}
+                      | {m["id"] for m in top_reacted}
+                      | {m["id"] for m in texted[-2:]})
+            sample = [m["text"] for m in items if m["id"] in picked][:8]
+            reacts_total = sum(m["re"] for m in items)
+            first_id = items[0]["id"]
+            link = (f"https://t.me/{username}/{first_id}" if username
+                    else f"https://t.me/c/{entity.id}/{first_id}")
+            threads.append({"chat": chat_name, "link": link, "n": len(items),
+                            "reacts": reacts_total, "sample": sample,
+                            "rank": len(items) + reacts_total})
+
+    threads.sort(key=lambda t: -t["rank"])
+    return threads[: cfg.get("chat_topics_max", 5)], warnings
+
+
+def name_chat_topics(threads, cfg):
+    """Один вызов LLM: назвать тему и суть каждой ветки."""
+    blocks = []
+    for i, t in enumerate(threads, 1):
+        sample = "\n".join(f"- {s}" for s in t["sample"])
+        blocks.append(f"[{i}] чат «{t['chat']}», сообщений {t['n']}, "
+                      f"реакций {t['reacts']}\n{sample}")
+    resp = llm_client().chat.completions.create(
+        model=cfg.get("model", "deepseek-chat"),
+        messages=[{"role": "system", "content": CHAT_PROMPT_TEMPLATE},
+                  {"role": "user", "content": "\n\n".join(blocks)}],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+        max_tokens=1500,
+    )
+    out = {}
+    data = json.loads(resp.choices[0].message.content)
+    for item in data.get("threads", []):
+        try:
+            out[int(item["id"])] = {
+                "title": str(item.get("title", "")).strip()[:80],
+                "gist": str(item.get("gist", "")).strip()[:220],
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def format_chat_block(threads, cfg):
+    """Строки блока «Обсуждения в чатах» для дайджеста."""
+    if not threads:
+        return []
+    names = name_chat_topics(threads, cfg)
+    lines = []
+    for i, t in enumerate(threads, 1):
+        info = names.get(i) or {}
+        title = info.get("title") or "Обсуждение"
+        gist = f": {esc(info['gist'])}" if info.get("gist") else ""
+        stats = (f"{fmt_n(t['n'], 'сообщение', 'сообщения', 'сообщений')} · "
+                 f"{fmt_n(t['reacts'], 'реакция', 'реакции', 'реакций')}")
+        lines.append(f"• <b>{esc(title)}</b>{gist} ({stats}) · "
+                     f'<a href="{t["link"]}">{esc(t["chat"])}</a>')
+    return lines
+
+
+async def run_weather(client, cfg, args):
+    """Режим --weather: алерт приходит только при резком ухудшении на завтра."""
+    channels = cfg.get("weather_channels") or []
+    if not channels:
+        print("weather: weather_channels не заданы в config.yaml", file=sys.stderr)
+        return
+    posts, warnings = await fetch_posts(client, cfg, channels=channels)
+    if warnings:
+        print("weather: " + "; ".join(warnings), file=sys.stderr)
+    if not posts:
+        print("weather: свежих постов нет, молчим", file=sys.stderr)
+        return
+
+    user_msg = "\n\n".join(
+        f"[{p['idx']}] ({p['channel']}, {p['time']})\n{p['text']}" for p in posts)
+    resp = llm_client().chat.completions.create(
+        model=cfg.get("model", "deepseek-chat"),
+        messages=[{"role": "system", "content": WEATHER_PROMPT_TEMPLATE},
+                  {"role": "user", "content": user_msg}],
+        response_format={"type": "json_object"},
+        temperature=0.0,
+        max_tokens=600,
+    )
+    data = json.loads(resp.choices[0].message.content)
+    if not data.get("alert"):
+        print("weather: резких изменений не обещают, молчим", file=sys.stderr)
+        return
+
+    text = ("🌧 <b>Погода завтра резко портится</b>\n"
+            + esc(str(data.get("message", "")).strip()))
+    if args.dry_run:
+        print(re.sub(r"</?[a-z][^>]*>", "", text))
+        return
+    target = "me" if args.to_me else cfg.get("weather_target", "me")
+    for part in split_message(text):
+        await client.send_message(target, part, parse_mode="html",
+                                  link_preview=False)
+
+
 def links_html(topic, by_idx, limit=2):
     out = []
     for pid in topic["post_ids"][:limit]:
@@ -216,7 +405,7 @@ def links_html(topic, by_idx, limit=2):
     return " · ".join(out)
 
 
-def build_digest(topics, posts, cfg, warnings):
+def build_digest(topics, posts, cfg, warnings, chat_lines=None):
     by_idx = {p["idx"]: p for p in posts}
     main = topics[0] if topics and topics[0]["score"] >= cfg["main_threshold"] else None
     rest = topics[1:] if main else topics
@@ -234,8 +423,6 @@ def build_digest(topics, posts, cfg, warnings):
         lines += ["", f"<b>Главное: {esc(main['title'])}</b>"]
         if main.get("why"):
             lines.append(esc(main["why"]))
-        if main.get("action"):
-            lines.append(f"Что сделать: {esc(main['action'])}")
         l = links_html(main, by_idx)
         if l:
             lines.append(l)
@@ -247,6 +434,9 @@ def build_digest(topics, posts, cfg, warnings):
         for t in worth:
             l = links_html(t, by_idx, limit=1)
             lines.append(f"• {esc(t['title'])}" + (f" · {l}" if l else ""))
+
+    if chat_lines:
+        lines += ["", "<b>Обсуждения в чатах:</b>", *chat_lines]
 
     total_chars = sum(p.get("full_len", len(p["text"])) for p in posts)
     saved_min = max(1, round(total_chars / READ_SPEED))
@@ -289,6 +479,8 @@ async def main():
                     help="напечатать дайджест в консоль, не отправлять в Telegram")
     ap.add_argument("--to-me", action="store_true",
                     help="отправить в Избранное вместо target из конфига")
+    ap.add_argument("--weather", action="store_true",
+                    help="погодный дежурный: алерт только при резком ухудшении")
     args = ap.parse_args()
 
     load_dotenv(BASE_DIR / ".env")
@@ -304,14 +496,31 @@ async def main():
     try:
         # прогрев кэша сущностей, без этого приватные каналы по ID не резолвятся
         await client.get_dialogs()
+
+        if args.weather:
+            await run_weather(client, cfg, args)
+            await client.disconnect()
+            return
+
         posts, warnings = await fetch_posts(client, cfg)
-        if not posts:
+
+        chat_lines = []
+        if cfg.get("chats"):
+            try:
+                threads, chat_warn = await fetch_chat_threads(client, cfg)
+                warnings += chat_warn
+                chat_lines = format_chat_block(threads, cfg)
+            except Exception as e:
+                # чаты не должны ронять новостной дайджест
+                warnings.append(f"блок чатов пропущен: {e!r}")
+
+        if not posts and not chat_lines:
             digest = "За сутки ни одного содержательного поста (после фильтра рекламы)."
             if warnings:
                 digest += "\nПроблемы: " + esc("; ".join(warnings))
         else:
-            topics = rank_topics(posts, cfg)
-            digest = build_digest(topics, posts, cfg, warnings)
+            topics = rank_topics(posts, cfg) if posts else []
+            digest = build_digest(topics, posts, cfg, warnings, chat_lines)
     except SystemExit:
         raise
     except Exception as e:
