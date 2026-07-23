@@ -72,6 +72,8 @@ PROMPT_TEMPLATE = """Ты персональный фильтр новостей
 3. Для тем со score 6 и выше заполни why (почему это влияет лично на него,
    1-2 предложения) и action (конкретный следующий шаг, если он есть, иначе null).
 4. Ничего не выдумывай, опирайся только на факты из постов.
+5. Верни не больше 35 тем: одиночные малозначимые посты объединяй
+   в сборные темы.
 
 Ответь строго валидным json без пояснений, схема:
 {"topics": [{"title": "суть темы одной строкой, до 90 знаков, без кликбейта",
@@ -180,9 +182,20 @@ def rank_topics(posts, cfg):
                   {"role": "user", "content": user_msg}],
         response_format={"type": "json_object"},
         temperature=0.2,
-        max_tokens=4000,
+        max_tokens=8000,
     )
-    data = json.loads(resp.choices[0].message.content)
+    raw = resp.choices[0].message.content
+    if resp.choices[0].finish_reason == "length":
+        print("warning: ответ модели обрезан по лимиту токенов", file=sys.stderr)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # ответ оборвался: отрезаем хвост до последней целой темы,
+        # закрываем JSON и работаем с тем, что успело прийти
+        cut = raw.rfind("},")
+        if cut == -1:
+            raise
+        data = json.loads(raw[: cut + 1] + "]}")
     topics = data.get("topics", [])
     for t in topics:
         try:
@@ -274,6 +287,8 @@ async def main():
     ap = argparse.ArgumentParser(description="Персональный дайджест Telegram-каналов")
     ap.add_argument("--dry-run", action="store_true",
                     help="напечатать дайджест в консоль, не отправлять в Telegram")
+    ap.add_argument("--to-me", action="store_true",
+                    help="отправить в Избранное вместо target из конфига")
     args = ap.parse_args()
 
     load_dotenv(BASE_DIR / ".env")
@@ -312,10 +327,22 @@ async def main():
     if args.dry_run:
         print(re.sub(r"</?[a-z][^>]*>", "", digest))
     else:
-        target = cfg.get("target", "me")
-        for part in split_message(digest):
-            await client.send_message(target, part, parse_mode="html",
-                                      link_preview=False)
+        target = "me" if args.to_me else cfg.get("target", "me")
+        try:
+            for part in split_message(digest):
+                await client.send_message(target, part, parse_mode="html",
+                                          link_preview=False)
+        except Exception as e:
+            if target == "me":
+                raise
+            # канал недоступен (переименован, нет прав и т.п.):
+            # дайджест не теряем, несём его в Избранное с пояснением
+            note = (f"Не смог отправить в '{esc(str(target))}': "
+                    f"{esc(repr(e))}. Дайджест ниже, проверьте target "
+                    f"в config.yaml.")
+            for part in split_message(note + "\n\n" + digest):
+                await client.send_message("me", part, parse_mode="html",
+                                          link_preview=False)
 
     await client.disconnect()
 
