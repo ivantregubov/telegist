@@ -69,8 +69,9 @@ PROMPT_TEMPLATE = """Ты персональный фильтр новостей
 2. Каждой теме поставь score от 0 до 10 по силе влияния именно на этого человека.
    Будь скуп: 8-10 это редкость (прямое влияние на деньги или планы), 6-7 значимо,
    4-5 фон, 0-3 шум.
-3. Для тем со score 6 и выше заполни why (почему это влияет лично на него,
-   1-2 предложения).
+3. Для тем со score 6 и выше заполни why: почему это влияет лично на него,
+   одной сжатой фразой. Пояснение обязано быть КОРОЧЕ формулировки самой
+   темы (title), это жёсткое требование.
 4. Ничего не выдумывай, опирайся только на факты из постов.
 5. Верни не больше 35 тем: одиночные малозначимые посты объединяй
    в сборные темы.
@@ -405,6 +406,19 @@ async def run_weather(client, cfg, args):
                                   link_preview=False)
 
 
+def fit_why(why, title):
+    """Пояснение не длиннее формулировки темы. Если модель нарушила правило,
+    оставляем первое предложение; если и оно длиннее темы, опускаем пояснение."""
+    why = (why or "").strip()
+    if not why:
+        return ""
+    limit = len(title)
+    if len(why) <= limit:
+        return why
+    first = re.split(r"(?<=[.!?])\s+", why)[0]
+    return first if len(first) <= limit else ""
+
+
 def links_html(topic, by_idx, limit=2):
     out = []
     for pid in topic["post_ids"][:limit]:
@@ -430,8 +444,9 @@ def build_digest(topics, posts, cfg, warnings, chat_lines=None):
 
     if main:
         lines += ["", f"<b>Главное: {esc(main['title'])}</b>"]
-        if main.get("why"):
-            lines.append(esc(main["why"]))
+        why = fit_why(main.get("why"), main["title"])
+        if why:
+            lines.append(esc(why))
         l = links_html(main, by_idx)
         if l:
             lines.append(l)
