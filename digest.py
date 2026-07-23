@@ -16,6 +16,7 @@ import html
 import json
 import os
 import re
+import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,6 +34,18 @@ MSK = timezone(timedelta(hours=3))
 TG_MSG_LIMIT = 4096            # лимит Telegram на длину одного сообщения
 CONTEXT_CHAR_BUDGET = 120_000  # защита от переполнения контекста модели
 READ_SPEED = 1000              # знаков в минуту, консервативная скорость чтения
+MEMORY_DB = BASE_DIR / "memory.db"
+MEMORY_MIN_OVERLAP = 2         # сколько общих ключевых слов считать совпадением
+MEMORY_MAX_HINTS = 12          # сколько прошлых тем максимум показать модели
+
+# Служебные слова: в ключевые слова темы не попадают
+STOPWORDS = {
+    "или", "для", "как", "что", "это", "все", "уже", "при", "над", "под",
+    "про", "год", "года", "году", "лет", "млн", "млрд", "тыс", "руб",
+    "рублей", "процентов", "может", "будет", "будут", "было", "были",
+    "россии", "российский", "российская", "новый", "новая", "новые",
+    "после", "перед", "между", "около", "более", "менее", "самый",
+}
 
 # Пожелание в конце дайджеста, ротация по дню года: без повторов подряд
 WISHES = [
@@ -78,7 +91,8 @@ PROMPT_TEMPLATE = """Ты персональный фильтр новостей
 
 ТОН (обязательно):
 - Пиши нейтрально и спокойно. Запрещены слова "рухнул", "обвал", "катастрофа",
-  "шок", "паника", "тревожный сигнал" и подобная драматизация.
+  "шок", "паника", "тревожный сигнал" и подобная драматизация. Не "рубль
+  рухнул", а "рубль ослаб на 3%".
 - Отделяй свершившееся от прогнозов. Мнение аналитиков остаётся мнением:
   "аналитики допускают снижение", а не "рынок ждёт падение".
 - В why указывай горизонт: это касается ближайших дней, месяцев или года.
@@ -243,6 +257,119 @@ def rank_topics(posts, cfg):
         t["post_ids"] = [i for i in t.get("post_ids", []) if isinstance(i, int)]
     topics.sort(key=lambda t: -t["score"])
     return topics
+
+
+REVISE_PROMPT = """Ты уточняешь оценки тем новостного дайджеста с учётом того,
+что человек уже читал за последние недели.
+
+ТЕМЫ ИЗ ПРОШЛЫХ ДАЙДЖЕСТОВ:
+{SEEN}
+
+Ниже сегодняшние темы с их оценками. Для каждой реши:
+- если тема повторяет уже прочитанное и нового по сути нет (тот же факт,
+  пересказ, продолжающийся фон) — сильно понизь score, до 0-2;
+- если это реальное развитие сюжета (новое решение, новые числа, смена
+  ситуации) — оставь оценку как есть, даже если тема звучит похоже;
+- если тема с прошлым не связана — оставь оценку без изменений.
+
+Ответь строго валидным json, только изменившиеся темы:
+{"changes": [{"id": 3, "score": 1}]}"""
+
+
+def revise_with_memory(topics, cfg):
+    """Понижает оценки тем, которые уже звучали и не получили развития."""
+    hints = recall_similar(topics, cfg)
+    if not hints:
+        return topics
+    listing = "\n".join(f"[{i}] score {t['score']}: {t.get('title', '')}"
+                        for i, t in enumerate(topics))
+    system = REVISE_PROMPT.replace("{SEEN}", "\n".join(f"- {h}" for h in hints))
+    try:
+        resp = llm_client().chat.completions.create(
+            model=cfg.get("model", "deepseek-chat"),
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": listing}],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=1000,
+        )
+        changes = json.loads(resp.choices[0].message.content).get("changes", [])
+    except Exception as e:
+        print(f"memory: пересмотр не удался ({e!r})", file=sys.stderr)
+        return topics
+
+    for ch in changes:
+        try:
+            i, new = int(ch["id"]), int(ch["score"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 <= i < len(topics) and new < topics[i]["score"]:
+            topics[i]["score"] = max(0, new)  # память только понижает
+    topics.sort(key=lambda t: -t["score"])
+    return topics
+
+
+def keywords(text):
+    """Ключевые слова темы: длинные слова и числа, без служебных."""
+    words = re.findall(r"[а-яёa-z0-9]{4,}", (text or "").lower())
+    return {w for w in words if w not in STOPWORDS}
+
+
+def memory_db(cfg):
+    """Открывает базу памяти и чистит записи старше окна памяти."""
+    con = sqlite3.connect(MEMORY_DB)
+    con.execute("CREATE TABLE IF NOT EXISTS seen "
+                "(day TEXT, title TEXT, kw TEXT)")
+    con.execute("CREATE INDEX IF NOT EXISTS seen_day ON seen(day)")
+    cutoff = (datetime.now(MSK)
+              - timedelta(days=cfg.get("memory_days", 28))).strftime("%Y-%m-%d")
+    con.execute("DELETE FROM seen WHERE day < ?", (cutoff,))
+    con.commit()
+    return con
+
+
+def recall_similar(topics, cfg):
+    """Ищет прошлые темы, пересекающиеся с сегодняшними по ключевым словам.
+    Возвращает строки-подсказки для промпта."""
+    try:
+        con = memory_db(cfg)
+    except sqlite3.Error as e:
+        print(f"memory: база недоступна ({e!r}), работаем без памяти",
+              file=sys.stderr)
+        return []
+    rows = con.execute("SELECT day, title, kw FROM seen").fetchall()
+    con.close()
+
+    today_kw = [keywords(t.get("title", "")) for t in topics]
+    hints = {}
+    for day, title, kw_raw in rows:
+        past_kw = set((kw_raw or "").split())
+        if not past_kw:
+            continue
+        for kw in today_kw:
+            if len(kw & past_kw) >= MEMORY_MIN_OVERLAP:
+                hints[title] = max(hints.get(title, ""), day)
+                break
+    return [f"{day}: {title}" for title, day in
+            sorted(hints.items(), key=lambda x: -len(x[1]))[:MEMORY_MAX_HINTS]]
+
+
+def remember(topics, cfg):
+    """Сохраняет сегодняшние значимые темы в память."""
+    keep = [t for t in topics if t.get("score", 0) >= cfg.get("worth_threshold", 4)]
+    if not keep:
+        return
+    day = datetime.now(MSK).strftime("%Y-%m-%d")
+    try:
+        con = memory_db(cfg)
+        con.executemany(
+            "INSERT INTO seen VALUES (?, ?, ?)",
+            [(day, t["title"], " ".join(sorted(keywords(t["title"]))))
+             for t in keep])
+        con.commit()
+        con.close()
+    except sqlite3.Error as e:
+        print(f"memory: не удалось сохранить ({e!r})", file=sys.stderr)
 
 
 def llm_client():
@@ -544,6 +671,12 @@ async def main():
                 digest += "\nПроблемы: " + esc("; ".join(warnings))
         else:
             topics = rank_topics(posts, cfg) if posts else []
+            if topics and cfg.get("memory_days", 28) > 0:
+                topics = revise_with_memory(topics, cfg)
+                # тестовые прогоны память не пишут: иначе завтрашний дайджест
+                # сочтёт эти темы уже опубликованными
+                if not (args.dry_run or args.to_me):
+                    remember(topics, cfg)
             digest = build_digest(topics, posts, cfg, warnings, chat_lines)
     except SystemExit:
         raise

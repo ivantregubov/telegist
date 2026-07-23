@@ -1,0 +1,15 @@
+# Секреты: утечка .env или файла сессии равна полному доступу
+# к аккаунту Telegram и балансу DeepSeek
+.env
+*.session
+*.session-journal
+
+# Личный конфиг с профилем: в репозиторий идёт config.example.yaml
+config.yaml
+
+# Рабочие файлы
+digest.log
+memory.db
+__pycache__/
+venv/
+.venv/
