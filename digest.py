@@ -18,6 +18,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -34,6 +35,8 @@ MSK = timezone(timedelta(hours=3))
 TG_MSG_LIMIT = 4096            # лимит Telegram на длину одного сообщения
 CONTEXT_CHAR_BUDGET = 120_000  # защита от переполнения контекста модели
 READ_SPEED = 1000              # знаков в минуту, консервативная скорость чтения
+BATCH_POSTS = 50               # постов в одном запросе: размер ответа модели
+                               # перестаёт зависеть от размера новостного дня
 MEMORY_DB = BASE_DIR / "memory.db"
 MEMORY_MIN_OVERLAP = 2         # сколько общих ключевых слов считать совпадением
 MEMORY_MAX_HINTS = 12          # сколько прошлых тем максимум показать модели
@@ -86,7 +89,7 @@ PROMPT_TEMPLATE = """Ты персональный фильтр новостей
    одной сжатой фразой. Пояснение обязано быть КОРОЧЕ формулировки самой
    темы (title), это жёсткое требование.
 4. Ничего не выдумывай, опирайся только на факты из постов.
-5. Верни не больше 35 тем: одиночные малозначимые посты объединяй
+5. Верни не больше 25 тем: одиночные малозначимые посты объединяй
    в сборные темы.
 
 ТОН (обязательно):
@@ -220,43 +223,109 @@ async def fetch_posts(client, cfg, channels=None):
     return posts, warnings
 
 
-def rank_topics(posts, cfg):
-    """Один запрос к DeepSeek: дедупликация тем и оценка личной значимости."""
-    llm = OpenAI(api_key=os.environ["DEEPSEEK_API_KEY"],
-                 base_url="https://api.deepseek.com")
+def llm_json(system, user, cfg, max_tokens, temperature=0.2, attempts=3):
+    """Единая точка обращений к модели с ответом строго в JSON.
+
+    Закрывает три известных сбоя:
+    - режим размышлений V4 включён по умолчанию и может сжечь весь лимит
+      токенов до начала ответа, поэтому выключаем его явно;
+    - в JSON-режиме DeepSeek документирован редкий пустой ответ, поэтому
+      пустой и не-JSON ответ повторяются с паузой;
+    - обрезанный по лимиту ответ чинится до последней целой записи."""
+    last_err = "нет ответа"
+    for attempt in range(attempts):
+        resp = llm_client().chat.completions.create(
+            model=cfg.get("model", "deepseek-v4-flash"),
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        choice = resp.choices[0]
+        raw = (choice.message.content or "").strip()
+        if choice.finish_reason == "length":
+            print("warning: ответ модели обрезан по лимиту токенов",
+                  file=sys.stderr)
+        if raw:
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                cut = raw.rfind("},")
+                if cut != -1:
+                    try:
+                        return json.loads(raw[: cut + 1] + "]}")
+                    except json.JSONDecodeError:
+                        pass
+                last_err = "не-JSON ответ, начало: " + raw[:120]
+        else:
+            last_err = ("пустой ответ; возможные причины: нулевой баланс "
+                        "DeepSeek, перегрузка API или устаревшее имя модели "
+                        "в config.yaml")
+        if attempt < attempts - 1:
+            time.sleep(3 * (attempt + 1))
+    raise RuntimeError(
+        f"модель не дала пригодный ответ за {attempts} попытки: {last_err}")
+
+
+def rank_topics(posts, cfg, warnings=None):
+    """Ранжирование постов пачками по BATCH_POSTS штук: большой новостной
+    день больше не упирается в лимит длины одного ответа."""
     system = PROMPT_TEMPLATE.replace("{PROFILE}", cfg["profile"].strip())
-    user_msg = "\n\n".join(
-        f"[{p['idx']}] ({p['channel']}, {p['time']})\n{p['text']}" for p in posts
-    )
-    resp = llm.chat.completions.create(
-        model=cfg.get("model", "deepseek-chat"),
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user_msg}],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-        max_tokens=8000,
-    )
-    raw = resp.choices[0].message.content
-    if resp.choices[0].finish_reason == "length":
-        print("warning: ответ модели обрезан по лимиту токенов", file=sys.stderr)
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # ответ оборвался: отрезаем хвост до последней целой темы,
-        # закрываем JSON и работаем с тем, что успело прийти
-        cut = raw.rfind("},")
-        if cut == -1:
-            raise
-        data = json.loads(raw[: cut + 1] + "]}")
-    topics = data.get("topics", [])
-    for t in topics:
+    topics, failed = [], []
+
+    for start in range(0, len(posts), BATCH_POSTS):
+        batch = posts[start:start + BATCH_POSTS]
+        user_msg = "\n\n".join(
+            f"[{p['idx']}] ({p['channel']}, {p['time']})\n{p['text']}"
+            for p in batch)
         try:
-            t["score"] = int(float(t.get("score") or 0))
-        except (TypeError, ValueError):
-            t["score"] = 0
-        t["post_ids"] = [i for i in t.get("post_ids", []) if isinstance(i, int)]
+            data = llm_json(system, user_msg, cfg, max_tokens=4000)
+        except RuntimeError as e:
+            failed.append(str(e))
+            continue
+        for t in data.get("topics", []):
+            try:
+                t["score"] = int(float(t.get("score") or 0))
+            except (TypeError, ValueError):
+                t["score"] = 0
+            t["post_ids"] = [i for i in t.get("post_ids", [])
+                             if isinstance(i, int)]
+            topics.append(t)
+
+    if failed:
+        if not topics:
+            raise RuntimeError(failed[-1])
+        if warnings is not None:
+            warnings.append(f"не обработано пачек постов: {len(failed)} "
+                            f"(последняя ошибка: {failed[-1]})")
+
+    topics = merge_similar(topics)
     topics.sort(key=lambda t: -t["score"])
     return topics
+
+
+def merge_similar(topics):
+    """Склейка дублей между пачками: одна новость, попавшая в разные пачки,
+    сливается в одну тему по пересечению ключевых слов заголовка."""
+    merged = []
+    for t in sorted(topics, key=lambda x: -x.get("score", 0)):
+        kw = keywords(t.get("title", ""))
+        target = None
+        if kw:
+            for m in merged:
+                if len(kw & m["_kw"]) >= 2:
+                    target = m
+                    break
+        if target:
+            target["post_ids"] = sorted(set(target["post_ids"] + t["post_ids"]))
+        else:
+            t["_kw"] = kw
+            merged.append(t)
+    for m in merged:
+        m.pop("_kw", None)
+    return merged
 
 
 REVISE_PROMPT = """Ты уточняешь оценки тем новостного дайджеста с учётом того,
@@ -285,15 +354,8 @@ def revise_with_memory(topics, cfg):
                         for i, t in enumerate(topics))
     system = REVISE_PROMPT.replace("{SEEN}", "\n".join(f"- {h}" for h in hints))
     try:
-        resp = llm_client().chat.completions.create(
-            model=cfg.get("model", "deepseek-chat"),
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": listing}],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-            max_tokens=1000,
-        )
-        changes = json.loads(resp.choices[0].message.content).get("changes", [])
+        changes = llm_json(system, listing, cfg, max_tokens=1000,
+                           temperature=0.0).get("changes", [])
     except Exception as e:
         print(f"memory: пересмотр не удался ({e!r})", file=sys.stderr)
         return topics
@@ -456,16 +518,9 @@ def name_chat_topics(threads, cfg):
         sample = "\n".join(f"- {s}" for s in t["sample"])
         blocks.append(f"[{i}] чат «{t['chat']}», сообщений {t['n']}, "
                       f"реакций {t['reacts']}\n{sample}")
-    resp = llm_client().chat.completions.create(
-        model=cfg.get("model", "deepseek-chat"),
-        messages=[{"role": "system", "content": CHAT_PROMPT_TEMPLATE},
-                  {"role": "user", "content": "\n\n".join(blocks)}],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-        max_tokens=1500,
-    )
+    data = llm_json(CHAT_PROMPT_TEMPLATE, "\n\n".join(blocks), cfg,
+                    max_tokens=1500)
     out = {}
-    data = json.loads(resp.choices[0].message.content)
     for item in data.get("threads", []):
         try:
             out[int(item["id"])] = {
@@ -509,15 +564,8 @@ async def run_weather(client, cfg, args):
 
     user_msg = "\n\n".join(
         f"[{p['idx']}] ({p['channel']}, {p['time']})\n{p['text']}" for p in posts)
-    resp = llm_client().chat.completions.create(
-        model=cfg.get("model", "deepseek-chat"),
-        messages=[{"role": "system", "content": WEATHER_PROMPT_TEMPLATE},
-                  {"role": "user", "content": user_msg}],
-        response_format={"type": "json_object"},
-        temperature=0.0,
-        max_tokens=600,
-    )
-    data = json.loads(resp.choices[0].message.content)
+    data = llm_json(WEATHER_PROMPT_TEMPLATE, user_msg, cfg,
+                    max_tokens=600, temperature=0.0)
     if not data.get("alert"):
         print("weather: резких изменений не обещают, молчим", file=sys.stderr)
         return
@@ -670,7 +718,7 @@ async def main():
             if warnings:
                 digest += "\nПроблемы: " + esc("; ".join(warnings))
         else:
-            topics = rank_topics(posts, cfg) if posts else []
+            topics = rank_topics(posts, cfg, warnings) if posts else []
             if topics and cfg.get("memory_days", 28) > 0:
                 topics = revise_with_memory(topics, cfg)
                 # тестовые прогоны память не пишут: иначе завтрашний дайджест
