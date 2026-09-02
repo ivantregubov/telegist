@@ -579,6 +579,15 @@ async def run_weather(client, cfg, args):
                                   link_preview=False)
 
 
+def to_plain(text):
+    """HTML-версия дайджеста → чистый текст для вставки в другие мессенджеры.
+    Ссылки разворачиваются в видимый URL, теги снимаются, HTML-экранирование
+    (&amp; и подобное) возвращается к обычным символам."""
+    text = re.sub(r'<a href="([^"]+)">([^<]*)</a>', r"\2 \1", text)
+    text = re.sub(r"</?[a-z][^>]*>", "", text)
+    return html.unescape(text)
+
+
 def links_html(topic, by_idx, limit=2):
     out = []
     for pid in topic["post_ids"][:limit]:
@@ -721,13 +730,15 @@ async def main():
         raise
 
     if args.dry_run:
-        print(re.sub(r"</?[a-z][^>]*>", "", digest))
+        print(to_plain(digest))
     else:
         target = "me" if args.to_me else cfg.get("target", "me")
+        sent = False
         try:
             for part in split_message(digest):
                 await client.send_message(target, part, parse_mode="html",
                                           link_preview=False)
+            sent = True
         except Exception as e:
             if target == "me":
                 raise
@@ -739,6 +750,16 @@ async def main():
             for part in split_message(note + "\n\n" + digest):
                 await client.send_message("me", part, parse_mode="html",
                                           link_preview=False)
+
+        # копия чистым текстом в Избранное: для ручной вставки туда, где
+        # нет API (например, канал в WB Chat). Отдельным сообщением без
+        # заголовков и пометок, чтобы копировалось целиком одним тапом.
+        if sent and cfg.get("plain_copy") and target != "me":
+            try:
+                for part in split_message(to_plain(digest)):
+                    await client.send_message("me", part, link_preview=False)
+            except Exception as e:
+                print(f"копия для вставки не ушла: {e!r}", file=sys.stderr)
 
     await client.disconnect()
 
